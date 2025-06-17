@@ -1,5 +1,5 @@
 ###############################################################################
-# 🌟 main.py ─ Desafio Stripe → Pub/Sub (Cloud Functions gen 2, Flask) 🌟
+# 🌟 main.py ─ Desafio Stripe → Pub/Sub (Cloud Functions gen 2) 🌟
 #
 # Este arquivo foi dividido em capítulos e subcapítulos comentados para
 # quem está aprendendo.  Siga os títulos → entenda cada etapa.  😉
@@ -14,12 +14,30 @@
 #    • logging    -> registrar o que acontece (DEBUG, INFO, ERROR…)
 #    • Flask      -> framework web WSGI (compatível nativo com Cloud Functions)
 #    • stripe     -> SDK oficial p/ validar assinatura do webhook
+#    • werkzeug.wrappers.Request / Response
+#   O functions-framework entrega a requisição num formato bruto chamado
+#   *WSGI environ* (um dicionário gigante cheio de chaves estranhas).
+#
+#   A biblioteca Werkzeug — que já vem instalada junto com
+#   functions-framework — fornece dois “envelopes” simplificados:
+#
+#   1. Request  → transforma o environ num objeto com métodos fáceis:
+#        • .get_data()   → corpo da requisição (bytes)
+#        • .headers      → dicionário de headers
+#        • .method       → GET, POST…
+#        • .args         → query-string (?foo=1&bar=2)
+#
+#   2. Response → permite criar a resposta sem escrever cabeçalhos na mão:
+#        • Response("texto", status=200, mimetype="text/plain")
+#        • Response(json_str, mimetype="application/json")
+#
+#   Assim, conseguimos ler e responder HTTP de forma amigável **sem**
+#   precisar instalar um framework inteiro como Flask ou FastAPI.  É
+#   “canônico” porque ainda obedece ao padrão WSGI que o runtime espera.
 # ────────────────────────────────────────────────────────────────────────────
-import os
-import json
-import logging
-from flask import Flask, request, jsonify
+import os, json, logging
 import stripe
+from werkzeug.wrappers import Request as WSGIRequest, Response as WSGIResponse
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -45,14 +63,15 @@ logger.setLevel(logging.INFO)  # exibirá INFO, WARNING, ERROR, CRITICAL
 # ---------------------------------------------------------------------------
 # 3.1  STRIPE_ENDPOINT_SECRET  →  chave para verificar assinatura do webhook
 # 3.2  PROJECT_ID & TOPIC_ID   →  onde publicaremos no Pub/Sub
-# 3.3  (Opcional) STRIPE_API_KEY → caso precise consultar a API depois
+# 3.3  STRIPE_ENDPOINT_SECRET  →  assinatura do webhook (obrigatório)
 #
 # Estas variáveis NÃO DEVEM ser hard-codeadas.  Use Secret Manager ou
 # --set-env-vars / --set-secrets no deploy.
 # ────────────────────────────────────────────────────────────────────────────
-STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET")
-PROJECT_ID             = os.getenv("PROJECT_ID")
-TOPIC_ID               = os.getenv("TOPIC_ID")
+#STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET", "whsec_mAUCESNM6KT8TKYTg2SqCAdhUAJr5hxy")
+STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET", "whsec_8cb23418a763552f5fe32df43f87c7ed7335828b26956b719884c1636de2d0d0")
+PROJECT_ID             = os.getenv("PROJECT_ID", "dev-stripe-webhoook-gfunc")
+TOPIC_ID               = os.getenv("TOPIC_ID", "dev-stripe-webhoook-pubsub")
 
 # Validação precoce: falha rápido se algo faltar
 if not all([STRIPE_ENDPOINT_SECRET, PROJECT_ID, TOPIC_ID]):
@@ -60,11 +79,6 @@ if not all([STRIPE_ENDPOINT_SECRET, PROJECT_ID, TOPIC_ID]):
         "⚠️  STRIPE_ENDPOINT_SECRET, PROJECT_ID ou TOPIC_ID não definidos!"
     )
     raise RuntimeError("Configuração incompleta.")
-
-# A key da Stripe não é obrigatória para webhooks,
-# mas mantemos para testes locais ou outras chamadas
-stripe.api_key = os.getenv("STRIPE_API_KEY", "")
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # CAPÍTULO 4 — CLIENTES GLOBAIS (REUSO) 🚀
@@ -111,7 +125,7 @@ def mark_processed(event_id: str):
         _cache[event_id] = True
 
 
-def publish_pubsub(event_dict: dict) -> None:
+def publish(event_dict: dict) -> None:
     """Publica dicionário no Pub/Sub (mensagem = JSON bytes)."""
     data = json.dumps(event_dict).encode()
     publisher.publish(topic_path, data).result()  # .result() bloqueia até ACK
@@ -119,78 +133,82 @@ def publish_pubsub(event_dict: dict) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# CAPÍTULO 6 — APLICATIVO FLASK (WSGI) 🍰
+# CAPÍTULO 6 — FUNÇÃO HTTP (TARGET) 🌐
 # ---------------------------------------------------------------------------
-# Flask é WSGI nativo → Cloud Functions (runtime python) aceita diretamente.
+# 6.1 Interface esperada: webhook(request)  ← o runtime chamará isso.
+# 6.2 Health-check simples em GET (útil para monitoria).
+# 6.3 Somente POST trata webhooks: valida assinatura, idempotência,
+#     publica, devolve 200 ou erro adequado.
+# 6.4 Qualquer erro interno gera 5xx → Stripe faz retry automático.
 # ────────────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+def webhook(request: WSGIRequest) -> WSGIResponse:
+    # 6.1 Health-check
+    if request.method == "GET":
+        return WSGIResponse(json.dumps({"status": "live"}), mimetype="application/json")
 
-# 6.1 Endpoint básico de health-check
-@app.route("/", methods=["GET"])
-def health():
-    """🩺 Verifica se a função está viva."""
-    return {"status": "live"}
+    # 6.2 Só permitimos POST
+    if request.method != "POST":
+        return WSGIResponse("Método não permitido", status=405)
 
-# 6.2 Endpoint que a Stripe chama
-@app.route("/webhook", methods=["POST"])
-def stripe_webhook():
-    """Processa eventos da Stripe."""
-    raw_body  = request.data                # corpo cru (bytes)
+    # 6.3 Validação de assinatura
+    raw_body  = request.get_data()
     signature = request.headers.get("Stripe-Signature", "")
-
-    # 6.2.1 Validação de assinatura
     try:
-        event = stripe.Webhook.construct_event(
-            raw_body.decode(), signature, STRIPE_ENDPOINT_SECRET
-        )
+        event = stripe.Webhook.construct_event(raw_body.decode(), signature, STRIPE_ENDPOINT_SECRET)
     except ValueError:
-        logger.warning("🛑 Payload JSON inválido")
-        return "Invalid payload", 400
+        return WSGIResponse("Invalid payload", status=400)
     except stripe.error.SignatureVerificationError:
-        logger.warning("🛑 Assinatura Stripe inválida")
-        return "Invalid signature", 400
+        return WSGIResponse("Invalid signature", status=400)
 
-    # 6.2.2 Checagem de duplicata
+    # 6.4 Idempotência + publicação
     eid = event["id"]
     if already_processed(eid):
-        logger.info("🔄 Evento %s duplicado – ignorado", eid)
-        return jsonify(status="duplicate"), 200
+        logger.info("🔄 Duplicate %s — ignorado", eid)
+        return WSGIResponse(json.dumps({"status": "duplicate"}), mimetype="application/json")
 
-    # 6.2.3 Publicação no Pub/Sub
     try:
-        publish_pubsub(event)
+        publish(event)
         mark_processed(eid)
-        return jsonify(status="ok"), 200
+        return WSGIResponse(json.dumps({"status": "ok"}), mimetype="application/json")
     except Exception as exc:
-        # Qualquer erro aqui resulta em 5xx → Stripe fará retry automático
-        logger.error("Erro ao publicar: %s", exc, exc_info=True)
-        return "Internal error", 500
-
+        logger.error("Falha Pub/Sub: %s", exc, exc_info=True)
+        return WSGIResponse("Internal error", status=500)
 
 # ────────────────────────────────────────────────────────────────────────────
-# CAPÍTULO 7 — ENTRY-POINT PARA CLOUD FUNCTIONS 🌐
+# CAPÍTULO 7 — COMO USAR (PASSO A PASSO) 🛠️
 # ---------------------------------------------------------------------------
-# Quando fazemos:
-#    gcloud functions deploy stripe-webhook --entry-point app …
+# 7.1 Testar localmente
+#     1) `pip install -r requirements.txt`
+#     2) `python -m functions_framework --target=webhook --port 8080`
+#     3) `stripe listen --forward-to localhost:8080`
+#     4) `stripe trigger payment_intent.succeeded` (envia evento fictício)
 #
-# O runtime procura um objeto WSGI chamado app.  NÃO precisamos
-# escrever nenhuma função wrapper extra.
-# ────────────────────────────────────────────────────────────────────────────
-
-###############################################################################
-# DICAS DE DEPLOY
-# -----------------------------------------------------------------------------
-# • Deploy gen 2, runtime python310, sem Docker:
+# 7.2 Criar tópico Pub/Sub (uma vez):
+#     gcloud pubsub topics create stripe-events
 #
-# gcloud functions deploy stripe-webhook \
-#   --gen2 --runtime python310 --region us-central1 \
-#   --trigger-http --allow-unauthenticated \
-#   --entry-point app \
-#   --memory 256Mi --timeout 60s --concurrency 10 \
-#   --set-secrets STRIPE_ENDPOINT_SECRET=projects/$PRJ/secrets/STRIPE_ENDPOINT_SECRET:latest \
-#   --set-env-vars PROJECT_ID=$PROJECT_ID,TOPIC_ID=$TOPIC_ID,USE_FIRESTORE_DEDUPE=true
+# 7.3 Guardar o secret no Secret Manager:
+#     echo "whsec_..." | gcloud secrets create STRIPE_ENDPOINT_SECRET \
+#       --data-file=- --replication-policy=automatic
 #
-# • Teste local (necessário functions-framework no requirements.txt):
-#   python -m functions_framework --target=app
-#   stripe listen --forward-to localhost:8080/webhook
+# 7.4 Deploy:
+#     gcloud functions deploy stripe-webhook \
+#       --gen2 --runtime python310 --region us-central1 \
+#       --trigger-http --allow-unauthenticated \
+#       --entry-point webhook \
+#       --memory 256Mi --timeout 60s --concurrency 10 \
+#       --set-secrets STRIPE_ENDPOINT_SECRET=projects/$(gcloud config get-value project)/secrets/STRIPE_ENDPOINT_SECRET:latest \
+#       --set-env-vars PROJECT_ID=$(gcloud config get-value project),TOPIC_ID=stripe-events,LOG_LEVEL=INFO
+#       # acrescente USE_FIRESTORE_DEDUPE=true se quiser deduplicação persistente
+#
+# 7.5 Copiar a URL exibida (<…cloudfunctions.net/stripe-webhook>) e adicionar
+#     na Stripe Dashboard  ➜ Developers ➜ Webhooks ➜ *Add endpoint*  (sufixo /).
+#
+# 7.6 Ver logs: Console → Operations → Logging → “stripe_webhook_func”.
+#     Ver mensagens: Pub/Sub → tópicos → stripe-events → subscriptions.
+#
+# 7.7 Custos básicos:
+#     • Cloud Functions escala a zero: US$ 0 quando ociosa.
+#     • Pub/Sub: 1 Mi msgs ≈ US$ 0,40.
+#     • Secret Manager: US$ 0,06 por segredo/mês.
+#     • Firestore (se usado): centavos por Mi leis/gravações + TTL deletes.
 ###############################################################################
